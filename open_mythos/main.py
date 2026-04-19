@@ -182,13 +182,13 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x         -- tensor of shape (B, T, H, head_dim); head_dim must be even
-        freqs_cis -- precomputed complex frequencies of shape (max_len, head_dim//2)
+        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2)
 
     Returns:
         Rotated tensor of the same shape and dtype as x
     """
     xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[: x.shape[1]].unsqueeze(0).unsqueeze(2)
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
     return torch.view_as_real(xc * freqs_cis).flatten(-2).to(x.dtype)
 
 
@@ -964,6 +964,7 @@ class OpenMythos(nn.Module):
         input_ids: torch.Tensor,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
@@ -974,6 +975,7 @@ class OpenMythos(nn.Module):
                          Increase at inference to extrapolate to harder problems.
             kv_cache  -- dict mutated in-place for autoregressive KV caching;
                          pass an empty dict {} and reuse across decode steps
+            start_pos -- Starting position index for RoPE. Used during decoding.
 
         Returns:
             Logits of shape (B, T, vocab_size)
@@ -984,7 +986,7 @@ class OpenMythos(nn.Module):
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
-        )[:T]
+        )[start_pos:start_pos + T]
         mask = self._causal_mask(T, device) if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
@@ -1030,8 +1032,9 @@ class OpenMythos(nn.Module):
         """
         kv_cache: dict = {}
         for step in range(max_new_tokens):
+            start_pos = 0 if step == 0 else input_ids.shape[1] - 1
             cur_ids = input_ids if step == 0 else input_ids[:, -1:]
-            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache)
+            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos)
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
                 v, _ = logits.topk(top_k)
@@ -1058,9 +1061,22 @@ class OpenMythosForCausalLM(PreTrainedModel):
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
+        past_key_values: Optional[dict] = None,
         **kwargs
     ) -> CausalLMOutputWithPast:
-        logits = self.model(input_ids, n_loops=n_loops)
+        # Determine start_pos automatically if KV cache is in use 
+        start_pos = 0
+        if past_key_values is not None:
+            # We find the shape of the past values to determine length
+            first_key = next(iter(past_key_values.keys()))
+            if "k" in past_key_values[first_key]:
+                start_pos = past_key_values[first_key]["k"].shape[1]
+            elif "c_kv" in past_key_values[first_key]:
+                start_pos = past_key_values[first_key]["c_kv"].shape[1]
+        
+        # We reuse past_key_values directly as kwargs kv_cache
+        kv_cache = past_key_values if past_key_values is not None else {}
+        logits = self.model(input_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos)
         
         loss = None
         if labels is not None:
@@ -1076,6 +1092,7 @@ class OpenMythosForCausalLM(PreTrainedModel):
             return CausalLMOutputWithPast(
                 loss=loss,
                 logits=logits,
+                past_key_values=kv_cache,
             )
         else:
             return logits, loss
