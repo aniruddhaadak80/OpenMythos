@@ -680,8 +680,12 @@ class LTIInjection(nn.Module):
         """
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
-        # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        # Lower clamp at -14: exp(-14) ≈ 8.3e-7 is above the float32 ULP threshold
+        # at 1.0 (~5.96e-8), so exp(-exp(x)) is always strictly less than 1.0 in
+        # float32 for any x >= -14. Using -20 would allow exp(-20) ≈ 2.06e-9, which
+        # is below float32_eps (≈ 1.19e-7), causing the outer exp to round to exactly
+        # 1.0 and silently break the ρ(A) < 1 guarantee after large gradient steps.
+        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-14, 20)))
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
